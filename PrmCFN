@@ -2,9 +2,10 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: One-time PRM/APN revenue attribution tagging framework. Discovers taggable resources, applies PartnerCentralID=<ProductCode>, verifies results, and stores evidence in S3.
 
 Parameters:
-  PartnerCentralID:
+ PartnerCentralID:
     Type: String
-    Description: Partner Central ID used as the PRM attribution tag key.
+    Default: aws-apn-id
+    Description: Tag Used for PRM principally modifiyable for reuse of scripts for other practices e.g MAP
 
   ProductCode:
     Type: String
