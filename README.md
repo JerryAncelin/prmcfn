@@ -1,264 +1,187 @@
-# APN Attribution CloudFormation Deployment
+# AWS PRM / APN Attribution Tagging Framework
 
-## Purpose
+This repository provides a one-time CloudFormation-based helper for AWS Partners who need to discover AWS resources and apply AWS Partner Revenue Measurement / APN attribution tags at scale.
 
-This CloudFormation template deploys a one-time APN Partner Revenue Measurement attribution workflow.
+The workflow discovers taggable AWS resources using AWS Resource Explorer, applies the required attribution tag, and stores inventory, apply results, and verification evidence in S3.
 
-The workflow discovers taggable AWS resources using AWS Resource Explorer, applies the required APN attribution tag, verifies the result, and stores inventory, execution, and verification evidence in an encrypted S3 bucket.
-
-The important correction in this version is that the Resource Explorer view is now created as part of the CloudFormation stack. The stack no longer depends on a manually created view existing in the same Region as the deployment.
+> This is an independent community helper. It is not an official AWS, AWS Partner Network, TD SYNNEX, SaaSify, or vendor-maintained solution.
 
 ---
 
-## Why the Resource Explorer View Is Included in the Stack
+## What this solution does
 
-The inventory Lambda uses AWS Resource Explorer to search for resources that support tags.
+The CloudFormation template deploys a Step Functions workflow with four Lambda functions:
 
-Even when Resource Explorer indexing is globally available, the Lambda still needs a Resource Explorer view that exists in the Region where the stack is deployed and where the Lambda executes.
+1. **Resolve Resource Explorer View**
+   - Checks whether a Resource Explorer view already exists in the deployment Region.
+   - Reuses the existing named view if found.
+   - Creates the view if it does not exist.
+   - Returns the Resource Explorer view ARN to the workflow.
 
-Previously, the Lambda depended on an existing view and attempted to discover one dynamically. That made the deployment fragile because the stack could fail or behave inconsistently if:
+2. **Generate Inventory**
+   - Uses the resolved Resource Explorer view ARN.
+   - Searches for taggable resources using the configured Resource Explorer query.
+   - Excludes known AWS-managed/default resources that should not be tagged directly.
+   - Writes the discovered inventory to S3.
 
-- no Resource Explorer view existed in the deployment Region;
-- multiple views existed and the Lambda selected the wrong one;
-- the default view was missing or not associated;
-- the view did not expose tag properties;
-- the Lambda executed in a Region different from the intended view.
+3. **Apply Tags**
+   - Reads the inventory from S3.
+   - Groups resources by Region.
+   - Applies the PRM/APN attribution tag using the Resource Groups Tagging API.
+   - Writes apply results to S3.
 
-This version fixes that by creating the view directly in CloudFormation and passing the view ARN explicitly to the Lambda.
+4. **Verify Tags**
+   - Reads the original inventory.
+   - Checks whether the expected tag is present on each resource.
+   - Writes verification evidence to S3.
 
 ---
 
-## Deployed Resources
+## Tagging model
 
-The template deploys the following core resources:
+For this implementation, the PRM attribution tag is built from two CloudFormation parameters:
 
-| Resource | Purpose |
+| Parameter | Purpose |
 |---|---|
-| `AWS::ResourceExplorer2::View` | Creates the Resource Explorer view used for inventory discovery. |
-| `AWS::ResourceExplorer2::DefaultViewAssociation` | Associates the created view as the default view in the deployment Region. |
-| `AWS::S3::Bucket` | Stores inventory, apply results, and verification evidence. |
-| `AWS::IAM::Role` for Lambda | Grants the Lambda functions permissions to discover resources, apply tags, verify tags, and write reports. |
-| `InventoryLambda` | Searches Resource Explorer and writes the discovered resources to S3. |
-| `ApplyTagsLambda` | Applies the APN attribution tag to discovered resources. |
-| `VerifyTagsLambda` | Reads tags back and confirms whether the APN tag was applied. |
-| `StepFunctionsRole` | Allows Step Functions to invoke the workflow Lambdas. |
-| `StateMachine` | Orchestrates inventory, tagging, and verification. |
+| `PartnerCentralID` | Used as the tag key |
+| `ProductCode` | Used as the tag value |
 
----
-
-## Parameters
-
-### `PartnerCentralID`
-
-APN Partner Central ID.
-
-This parameter is currently retained in the template for APN context and future compatibility. The active tagging logic in this version applies the `apn-id` tag using the `ProductCode` parameter as the value.
-
-### `ProductCode`
-
-The APN product code to apply as the value of the `apn-id` tag.
-
-Example final tag applied by the workflow:
+The resulting tag applied to resources is:
 
 ```text
-apn-id=<ProductCode>
+<PartnerCentralID> = <ProductCode>
 ```
 
-### `InventoryQuery`
-
-The Resource Explorer query used by the inventory Lambda.
-
-Default value:
+Example:
 
 ```text
-resourcetype.supports:tags
+1234567 = my-product-code
 ```
-
-This default targets resources discovered by Resource Explorer that support tags.
 
 ---
 
-## Resource Explorer View Fix
+## Why the Resource Explorer view is resolved by Lambda
 
-The template now includes the following Resource Explorer resources:
+Earlier versions attempted to create a Resource Explorer view directly in CloudFormation and associate it as the default view. That approach caused two practical issues in real AWS accounts:
 
-```yaml
-APNAttributionResourceExplorerView:
-  Type: AWS::ResourceExplorer2::View
-  Properties:
-    ViewName: apn-attribution-view
-    IncludedProperties:
-      - Name: tags
-    Tags:
-      - Key: Purpose
-        Value: APN attribution inventory and tagging
+- `AWS::ResourceExplorer2::View` does not accept the usual CloudFormation tag array syntax for `Tags`.
+- `AWS::ResourceExplorer2::DefaultViewAssociation` fails when the Region already has a default Resource Explorer view associated.
 
-APNAttributionDefaultViewAssociation:
-  Type: AWS::ResourceExplorer2::DefaultViewAssociation
-  Properties:
-    ViewArn: !Ref APNAttributionResourceExplorerView
-```
+The current version avoids both issues.
 
-The created view ARN is then injected into the inventory Lambda as an environment variable:
+Instead of relying on `DefaultViewAssociation`, the workflow starts with a resolver Lambda. This Lambda checks for a named Resource Explorer view in the Region where the stack is deployed, creates it if missing, and passes the exact view ARN into the inventory Lambda.
 
-```yaml
-RESOURCE_EXPLORER_VIEW_ARN: !Ref APNAttributionResourceExplorerView
-```
-
-Inside the Lambda, the view ARN is read directly from the environment:
-
-```python
-def get_view_arn():
-    return RESOURCE_EXPLORER_VIEW_ARN
-```
-
-This replaces the previous dynamic lookup logic that depended on `list_views()`.
+This makes the deployment more resilient in existing AWS accounts where Resource Explorer may already be partially configured.
 
 ---
 
-## Tagging Logic
-
-The inventory Lambda passes the tag key and value into the workflow output.
-
-Current configuration:
-
-```yaml
-TAG_KEY: apn-id
-TAG_VALUE: !Ref ProductCode
-```
-
-The apply Lambda receives those values from the Step Functions state and applies them using the Resource Groups Tagging API.
-
-The verification Lambda then checks whether each discovered resource has the expected tag value.
-
----
-
-## Workflow Execution
-
-The Step Functions state machine runs three main stages.
-
-### 1. Generate Inventory
-
-The `InventoryLambda` searches Resource Explorer using the configured query and view ARN.
-
-It writes the inventory to S3 under:
+## Architecture
 
 ```text
-inventory/apn-inventory-<timestamp>.json
+CloudFormation Stack
+      |
+      v
+Step Functions State Machine
+      |
+      +--> ResolveResourceExplorerView Lambda
+      |        |
+      |        +--> Reuse or create Resource Explorer view
+      |        +--> Return resource_explorer_view_arn
+      |
+      +--> GenerateInventory Lambda
+      |        |
+      |        +--> Search resources through Resource Explorer
+      |        +--> Store inventory JSON in S3
+      |
+      +--> ApplyTags Lambda
+      |        |
+      |        +--> Apply <PartnerCentralID>=<ProductCode>
+      |        +--> Store apply results in S3
+      |
+      +--> VerifyTags Lambda
+               |
+               +--> Verify expected tag value
+               +--> Store verification evidence in S3
 ```
-
-The inventory output includes:
-
-- AWS account ID;
-- Resource ARN;
-- Region;
-- AWS service;
-- Resource type;
-- tag key;
-- tag value;
-- inventory query;
-- generation timestamp.
-
-### 2. Apply Tags
-
-The `ApplyTagsLambda` groups resources by Region and applies the configured tag in batches.
-
-It writes the tagging result to S3 under:
-
-```text
-apply-results/apn-apply-<timestamp>.json
-```
-
-The apply result includes:
-
-- resource ARN;
-- Region;
-- tagging status;
-- failure details, if any;
-- applied tag key and value.
-
-### 3. Verify Tags
-
-The `VerifyTagsLambda` reads the current tags back using the Resource Groups Tagging API.
-
-It writes the verification result to S3 under:
-
-```text
-verification/apn-verification-<timestamp>.json
-```
-
-The verification output includes:
-
-- resource ARN;
-- Region;
-- whether the expected tag was found;
-- observed tag value;
-- full observed tag set.
 
 ---
 
-## Practical Resource Exclusions
+## Deployed AWS resources
 
-The inventory Lambda excludes a small set of resources that are commonly AWS-managed, default resources, or not safe to tag directly through this workflow.
+The template deploys:
 
-Current exclusions include:
-
-```python
-EXCLUDED_RESOURCE_TYPES = {
-    "cloudformation:stack",
-    "athena:datacatalog",
-}
-
-EXCLUDED_ARN_CONTAINS = [
-    ":datacatalog/AwsDataCatalog",
-    ":user/default",
-    ":acl/open-access",
-    ":parametergroup/default.memorydb-",
-]
-```
-
-CloudFormation resources are also excluded by service name.
-
-This prevents the workflow from trying to tag resources that are usually managed through stack update semantics or AWS default service configuration.
+- S3 bucket for reports and evidence
+- IAM role for Lambda functions
+- IAM role for Step Functions
+- Lambda function: `prm-resource-explorer-view-resolver`
+- Lambda function: `apn-attribution-inventory`
+- Lambda function: `apn-attribution-apply-tags`
+- Lambda function: `apn-attribution-verify-tags`
+- Step Functions state machine: `apn-attribution-one-time-workflow`
 
 ---
 
-## Deployment Steps
+## CloudFormation parameters
 
-### 1. Deploy the CloudFormation Stack
+| Parameter | Default | Description |
+|---|---:|---|
+| `PartnerCentralID` | None | Partner Central ID used as the PRM attribution tag key. |
+| `ProductCode` | None | Product code used as the PRM attribution tag value. |
+| `InventoryQuery` | `resourcetype.supports:tags` | Resource Explorer query used to discover resources. |
+| `ResourceExplorerViewName` | `prm-attribution-view` | Resource Explorer view name to reuse or create in the stack Region. |
 
-Deploy the template in the AWS Region where the Lambda workflow should execute.
+---
 
-Provide the required parameters:
+## Deployment
 
-- `PartnerCentralID`
-- `ProductCode`
-- optionally override `InventoryQuery`
+Deploy the CloudFormation template in the AWS account and Region where you want to run the tagging workflow.
 
-The default inventory query is usually sufficient for the APN attribution use case.
+Example using AWS CLI:
 
-### 2. Confirm Stack Outputs
+```bash
+aws cloudformation deploy \
+  --template-file prmcfn-with-resource-explorer-resolver.yaml \
+  --stack-name prm-attribution-tagging \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+      PartnerCentralID="YOUR_PARTNER_CENTRAL_ID" \
+      ProductCode="YOUR_PRODUCT_CODE"
+```
 
-After deployment, check the CloudFormation outputs:
+Optional parameter override for the Resource Explorer query:
 
-| Output | Description |
-|---|---|
-| `ResourceExplorerViewArn` | ARN of the Resource Explorer view created by the stack. |
-| `ReportBucket` | S3 bucket where reports and evidence are stored. |
-| `StateMachineArn` | Step Functions workflow to execute. |
-| `InventoryLambda` | Inventory Lambda function name. |
-| `ApplyTagsLambda` | Apply-tags Lambda function name. |
-| `VerifyTagsLambda` | Verification Lambda function name. |
+```bash
+aws cloudformation deploy \
+  --template-file prmcfn-with-resource-explorer-resolver.yaml \
+  --stack-name prm-attribution-tagging \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+      PartnerCentralID="YOUR_PARTNER_CENTRAL_ID" \
+      ProductCode="YOUR_PRODUCT_CODE" \
+      InventoryQuery="resourcetype.supports:tags" \
+      ResourceExplorerViewName="prm-attribution-view"
+```
 
-### 3. Start the Step Functions Workflow
+---
 
-Start the state machine manually from the AWS Console or through the AWS CLI.
+## Running the workflow
 
-No input payload is required for the standard execution path.
+After deployment, start the Step Functions state machine from the AWS Console or CLI.
 
-### 4. Review S3 Evidence
+CLI example:
 
-After execution, open the generated files in the report bucket:
+```bash
+aws stepfunctions start-execution \
+  --state-machine-arn "STATE_MACHINE_ARN_FROM_CLOUDFORMATION_OUTPUT"
+```
+
+The state machine input can be empty. The workflow resolves the Resource Explorer view and passes the view ARN internally between states.
+
+---
+
+## Evidence produced in S3
+
+The report bucket stores three categories of output:
 
 ```text
 inventory/
@@ -266,78 +189,103 @@ apply-results/
 verification/
 ```
 
-These files provide the evidence trail for discovery, tag application, and verification.
+### Inventory output
 
----
+Contains discovered resources and the tag expected to be applied.
 
-## Important Operational Notes
-
-### The Resource Explorer View Must Be Regional
-
-The view must exist in the same Region where the stack and Lambda function execute.
-
-This template now guarantees that by deploying the view as part of the same stack.
-
-### Tags Persist After Stack Deletion
-
-Tags applied to external resources by Lambda are not CloudFormation-managed resource properties.
-
-Deleting the CloudFormation stack removes the workflow infrastructure, but it does not remove the `apn-id` tags that were applied to discovered resources.
-
-### Resource Explorer Index Is Not Created by This Template
-
-This version creates the Resource Explorer view, not the Resource Explorer index.
-
-That is intentional. In many AWS environments, Resource Explorer is already enabled. Creating an index in CloudFormation can collide with an existing local or aggregator index.
-
-The missing dependency in this workflow was the regional view, so the template now owns that dependency directly.
-
-### Some AWS Internal or Default Resources May Be Discoverable but Not Taggable
-
-Resource Explorer can discover resources that are AWS-managed, default service resources, or not safely taggable through the Resource Groups Tagging API.
-
-The workflow handles this in two ways:
-
-1. by excluding known problematic resource patterns during inventory;
-2. by recording per-resource tagging failures in the apply result file.
-
-This means discovery and taggability are related but not identical.
-
----
-
-## Expected Final State
-
-After a successful workflow execution:
-
-- the stack owns the Resource Explorer view dependency;
-- inventory is generated from the stack-created view;
-- discovered taggable resources are tagged with `apn-id=<ProductCode>`;
-- verification evidence is written to S3;
-- failures are isolated per resource instead of failing the full workflow blindly;
-- APN attribution evidence can be reviewed from the S3 report bucket.
-
----
-
-## Recommended Validation Checklist
-
-Before considering the run complete, confirm the following:
-
-- CloudFormation stack deployed successfully.
-- `ResourceExplorerViewArn` output exists.
-- Step Functions execution completed successfully.
-- Inventory file exists in S3.
-- Apply-results file exists in S3.
-- Verification file exists in S3.
-- Verification count matches the expected resource scope.
-- Failed resources, if any, are reviewed manually.
-- Applied tag is visible on representative resources across multiple services and Regions.
-
----
-
-## File Reference
-
-Fixed CloudFormation template:
+Example path:
 
 ```text
-apn-attribution-framework-fixed-cfn.yaml
+inventory/apn-inventory-YYYYMMDDTHHMMSSZ.json
 ```
+
+### Apply results
+
+Contains tagging results and failed resources returned by the Resource Groups Tagging API.
+
+Example path:
+
+```text
+apply-results/apn-apply-YYYYMMDDTHHMMSSZ.json
+```
+
+### Verification output
+
+Contains the final observed tags and whether the expected tag value was found.
+
+Example path:
+
+```text
+verification/apn-verification-YYYYMMDDTHHMMSSZ.json
+```
+
+---
+
+## Retry and resilience behavior
+
+The solution includes retry logic in two layers.
+
+### Step Functions retry
+
+Each Lambda task has Step Functions retry rules for Lambda service errors, SDK client errors, throttling, and task failures.
+
+### Lambda-level retry
+
+The Resource Explorer resolver and inventory Lambda also include retry logic for transient Resource Explorer issues such as throttling, delayed view readiness, temporary `ResourceNotFoundException`, and validation timing issues.
+
+This is useful because Resource Explorer views may take a short amount of time to become readable/searchable immediately after creation.
+
+---
+
+## Resource exclusions
+
+The inventory Lambda excludes some practical resource types observed during pilot execution, including:
+
+- CloudFormation stacks
+- Athena default data catalog resources
+- AWS-managed/default MemoryDB resources
+- AWS-managed/default OpenSearch or ACL-style resources where direct tagging is not appropriate
+
+These exclusions are implemented to avoid applying tags to resources that are AWS-managed, default service resources, or better handled through service-specific lifecycle mechanisms.
+
+---
+
+## Important operational notes
+
+- Run this first in a non-production account.
+- Review IAM permissions before production use.
+- Some AWS resources discovered by Resource Explorer may not support tagging through the generic Resource Groups Tagging API.
+- Some resources may require service-specific tagging APIs.
+- Some AWS-managed resources may be discoverable but should not be tagged directly.
+- Stack deletion does not remove tags that were already applied to resources.
+- The Resource Explorer resolver intentionally avoids changing the account/Region default Resource Explorer view association.
+
+---
+
+## Cleanup behavior
+
+Deleting the CloudFormation stack removes the deployed automation resources such as Lambdas, IAM roles, Step Functions state machine, and the report bucket according to CloudFormation behavior.
+
+Tags already applied to AWS resources are not removed by deleting this stack.
+
+---
+
+## Repository scope
+
+This project contains a generic AWS automation pattern using public AWS services:
+
+- AWS CloudFormation
+- AWS Resource Explorer
+- AWS Lambda
+- AWS Step Functions
+- AWS IAM
+- Amazon S3
+- Resource Groups Tagging API
+
+It does not contain company-specific references, customer data, proprietary business logic, credentials, or internal documentation.
+
+---
+
+## Disclaimer
+
+This project is provided as-is as a community helper for AWS Partners. Validate the template, permissions, query scope, and tagging behavior against your own AWS environment and compliance requirements before use.
