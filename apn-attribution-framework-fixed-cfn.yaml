@@ -1,0 +1,464 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: One-time APN revenue attribution tagging framework. Discovers all taggable resources, applies apn-id=<ProductCode>, verifies results, and stores evidence in S3.
+
+Parameters:
+
+
+  PartnerCentralID:
+    Type: String
+    Description: APN Partner Central ID (not the AWS Account ID). Used to populate the apn-pcid tag.
+
+  ProductCode:
+    Type: String
+    Description: APN product code to apply as the value for the apn-id tag.
+  InventoryQuery:
+    Type: String
+    Default: "resourcetype.supports:tags"
+    Description: Resource Explorer query. Default targets every taggable discoverable resource.
+
+Resources:
+  APNAttributionResourceExplorerView:
+    Type: AWS::ResourceExplorer2::View
+    Properties:
+      ViewName: apn-attribution-view
+      IncludedProperties:
+        - Name: tags
+      Tags:
+        - Key: Purpose
+          Value: APN attribution inventory and tagging
+
+  APNAttributionDefaultViewAssociation:
+    Type: AWS::ResourceExplorer2::DefaultViewAssociation
+    Properties:
+      ViewArn: !Ref APNAttributionResourceExplorerView
+
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: apn-attribution-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: apn-layered-tagging-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LambdaLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: ResourceExplorerInventory
+                Effect: Allow
+                Action:
+                  - resource-explorer-2:Search
+                  - resource-explorer-2:GetView
+                Resource: "*"
+              - Sid: GenericTaggingApi
+                Effect: Allow
+                Action:
+                  - tag:TagResources
+                  - tag:GetResources
+                  - tag:GetTagKeys
+                  - tag:GetTagValues
+                Resource: "*"
+              - Sid: Ec2Tagging
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                Resource: "*"
+              - Sid: ServerlessWorkflowAndLogsTagging
+                Effect: Allow
+                Action:
+                  - lambda:TagResource
+                  - states:TagResource
+                  - events:TagResource
+                  - logs:TagResource
+                Resource: "*"
+              - Sid: StorageTagging
+                Effect: Allow
+                Action:
+                  - s3:GetBucketTagging
+                  - s3:PutBucketTagging
+                Resource: "*"
+              - Sid: DatabaseAndCacheTagging
+                Effect: Allow
+                Action:
+                  - rds:AddTagsToResource
+                  - dynamodb:TagResource
+                  - elasticache:AddTagsToResource
+                  - memorydb:TagResource
+                Resource: "*"
+              - Sid: AnalyticsAndObservabilityTagging
+                Effect: Allow
+                Action:
+                  - athena:TagResource
+                  - xray:TagResource
+                Resource: "*"
+              - Sid: ApplicationServicesTagging
+                Effect: Allow
+                Action:
+                  - apprunner:TagResource
+                Resource: "*"
+              - Sid: CloudFormationReadSupport
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: "*"
+              - Sid: S3ReportBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${ReportBucket.Arn}/*"
+
+  InventoryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: apn-attribution-inventory
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          REPORT_BUCKET: !Ref ReportBucket
+          INVENTORY_QUERY: !Ref InventoryQuery
+          RESOURCE_EXPLORER_VIEW_ARN: !Ref APNAttributionResourceExplorerView
+          TAG_KEY: !Ref PartnerCentralID
+          TAG_VALUE: !Ref ProductCode
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          rex = boto3.client("resource-explorer-2")
+          s3 = boto3.client("s3")
+          sts = boto3.client("sts")
+
+          BUCKET = os.environ["REPORT_BUCKET"]
+          QUERY = os.environ.get("INVENTORY_QUERY", "resourcetype.supports:tags")
+          RESOURCE_EXPLORER_VIEW_ARN = os.environ["RESOURCE_EXPLORER_VIEW_ARN"]
+          TAG_KEY = os.environ.get("TAG_KEY", "apn-id")
+          TAG_VALUE = os.environ["TAG_VALUE"]
+
+          # Practical exclusions observed during pilot execution.
+          # These resources are typically AWS-managed/default resources or require stack update semantics.
+          EXCLUDED_RESOURCE_TYPES = {
+              "cloudformation:stack",
+              "athena:datacatalog",
+          }
+          EXCLUDED_ARN_CONTAINS = [
+              ":datacatalog/AwsDataCatalog",
+              ":user/default",
+              ":acl/open-access",
+              ":parametergroup/default.memorydb-",
+          ]
+
+          def lambda_handler(event, context):
+              account_id = sts.get_caller_identity()["Account"]
+              view_arn = get_view_arn()
+              resources = []
+
+              paginator = rex.get_paginator("search")
+              for page in paginator.paginate(ViewArn=view_arn, QueryString=QUERY):
+                  for item in page.get("Resources", []):
+                      arn = item.get("Arn")
+                      region = item.get("Region")
+                      service = item.get("Service")
+                      resource_type = item.get("ResourceType")
+                      if not arn or not region:
+                          continue
+                      if is_excluded(arn, service, resource_type):
+                          continue
+                      resources.append({
+                          "account_id": account_id,
+                          "arn": arn,
+                          "region": region,
+                          "service": service,
+                          "resource_type": resource_type
+                      })
+
+              timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+              key = f"inventory/apn-inventory-{timestamp}.json"
+              payload = {
+                  "account_id": account_id,
+                  "tag_key": TAG_KEY,
+                  "tag_value": TAG_VALUE,
+                  "query": QUERY,
+                  "generated_at": timestamp,
+                  "resources": resources
+              }
+              s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(payload, indent=2).encode("utf-8"), ContentType="application/json")
+              return {
+                  "report_bucket": BUCKET,
+                  "inventory_key": key,
+                  "tag_key": TAG_KEY,
+                  "tag_value": TAG_VALUE,
+                  "resource_count": len(resources)
+              }
+
+          def get_view_arn():
+              return RESOURCE_EXPLORER_VIEW_ARN
+
+          def is_excluded(arn, service, resource_type):
+              rt = (resource_type or "").lower()
+              svc = (service or "").lower()
+              if rt in EXCLUDED_RESOURCE_TYPES:
+                  return True
+              if svc == "cloudformation":
+                  return True
+              for marker in EXCLUDED_ARN_CONTAINS:
+                  if marker in arn:
+                      return True
+              return False
+
+
+  ApplyTagsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: apn-attribution-apply-tags
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime, timezone
+
+          s3 = boto3.client("s3")
+
+          def lambda_handler(event, context):
+              bucket = event["report_bucket"]
+              inventory_key = event["inventory_key"]
+              tag_key = event["tag_key"]
+              tag_value = event["tag_value"]
+
+              inventory = json.loads(s3.get_object(Bucket=bucket, Key=inventory_key)["Body"].read())
+              grouped = {}
+              for resource in inventory.get("resources", []):
+                  arn = resource.get("arn")
+                  region = resource.get("region")
+                  if arn and region:
+                      grouped.setdefault(region, []).append(arn)
+
+              results = []
+              for region, arns in grouped.items():
+                  tagging = boto3.client("resourcegroupstaggingapi", region_name=region)
+                  for batch in chunks(arns, 20):
+                      response = tagging.tag_resources(ResourceARNList=batch, Tags={tag_key: tag_value})
+                      failures = response.get("FailedResourcesMap", {})
+                      for arn in batch:
+                          if arn in failures:
+                              results.append({"arn": arn, "region": region, "status": "failed", "failure": failures[arn]})
+                          else:
+                              results.append({"arn": arn, "region": region, "status": "tagged", "applied": {tag_key: tag_value}})
+
+              timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+              apply_key = f"apply-results/apn-apply-{timestamp}.json"
+              s3.put_object(Bucket=bucket, Key=apply_key, Body=json.dumps(results, indent=2).encode("utf-8"), ContentType="application/json")
+              return {
+                  "report_bucket": bucket,
+                  "inventory_key": inventory_key,
+                  "apply_results_key": apply_key,
+                  "tag_key": tag_key,
+                  "tag_value": tag_value,
+                  "processed": len(results),
+                  "tagged": sum(1 for r in results if r["status"] == "tagged"),
+                  "failed": sum(1 for r in results if r["status"] == "failed")
+              }
+
+          def chunks(items, size):
+              for i in range(0, len(items), size):
+                  yield items[i:i+size]
+
+
+  VerifyTagsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: apn-attribution-verify-tags
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime, timezone
+
+          s3 = boto3.client("s3")
+
+          def lambda_handler(event, context):
+              bucket = event["report_bucket"]
+              inventory_key = event["inventory_key"]
+              tag_key = event["tag_key"]
+              tag_value = event["tag_value"]
+
+              inventory = json.loads(s3.get_object(Bucket=bucket, Key=inventory_key)["Body"].read())
+              grouped = {}
+              for resource in inventory.get("resources", []):
+                  arn = resource.get("arn")
+                  region = resource.get("region")
+                  if arn and region:
+                      grouped.setdefault(region, []).append(arn)
+
+              verification = []
+              for region, arns in grouped.items():
+                  tagging = boto3.client("resourcegroupstaggingapi", region_name=region)
+                  for batch in chunks(arns, 100):
+                      response = tagging.get_resources(ResourceARNList=batch)
+                      found = {
+                          item["ResourceARN"]: {tag["Key"]: tag.get("Value", "") for tag in item.get("Tags", [])}
+                          for item in response.get("ResourceTagMappingList", [])
+                      }
+                      for arn in batch:
+                          tags = found.get(arn, {})
+                          verification.append({
+                              "arn": arn,
+                              "region": region,
+                              "verified": tags.get(tag_key) == tag_value,
+                              "observed_value": tags.get(tag_key),
+                              "observed_tags": tags
+                          })
+
+              timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+              verification_key = f"verification/apn-verification-{timestamp}.json"
+              s3.put_object(Bucket=bucket, Key=verification_key, Body=json.dumps(verification, indent=2).encode("utf-8"), ContentType="application/json")
+              return {
+                  "report_bucket": bucket,
+                  "inventory_key": inventory_key,
+                  "verification_key": verification_key,
+                  "checked": len(verification),
+                  "verified": sum(1 for r in verification if r["verified"]),
+                  "failed": sum(1 for r in verification if not r["verified"])
+              }
+
+          def chunks(items, size):
+              for i in range(0, len(items), size):
+                  yield items[i:i+size]
+
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: apn-attribution-stepfunctions-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: apn-attribution-stepfunctions-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt InventoryLambda.Arn
+                  - !GetAtt ApplyTagsLambda.Arn
+                  - !GetAtt VerifyTagsLambda.Arn
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: apn-attribution-one-time-workflow
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionSubstitutions:
+        InventoryLambdaArn: !GetAtt InventoryLambda.Arn
+        ApplyTagsLambdaArn: !GetAtt ApplyTagsLambda.Arn
+        VerifyTagsLambdaArn: !GetAtt VerifyTagsLambda.Arn
+      DefinitionString: |
+        {
+          "Comment": "One-time APN inventory-driven attribution tagging workflow",
+          "StartAt": "GenerateInventory",
+          "States": {
+            "GenerateInventory": {
+              "Type": "Task",
+              "Resource": "${InventoryLambdaArn}",
+              "ResultPath": "$.inventory",
+              "Next": "HasResources"
+            },
+            "HasResources": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.inventory.resource_count",
+                  "NumericGreaterThan": 0,
+                  "Next": "ApplyTagsFromInventory"
+                }
+              ],
+              "Default": "NoResources"
+            },
+            "ApplyTagsFromInventory": {
+              "Type": "Task",
+              "Resource": "${ApplyTagsLambdaArn}",
+              "Parameters": {
+                "report_bucket.$": "$.inventory.report_bucket",
+                "inventory_key.$": "$.inventory.inventory_key",
+                "tag_key.$": "$.inventory.tag_key",
+                "tag_value.$": "$.inventory.tag_value"
+              },
+              "ResultPath": "$.apply",
+              "Next": "VerifyTags"
+            },
+            "VerifyTags": {
+              "Type": "Task",
+              "Resource": "${VerifyTagsLambdaArn}",
+              "Parameters": {
+                "report_bucket.$": "$.inventory.report_bucket",
+                "inventory_key.$": "$.inventory.inventory_key",
+                "apply_results_key.$": "$.apply.apply_results_key",
+                "tag_key.$": "$.inventory.tag_key",
+                "tag_value.$": "$.inventory.tag_value"
+              },
+              "ResultPath": "$.verification",
+              "End": true
+            },
+            "NoResources": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+Outputs:
+  ResourceExplorerViewArn:
+    Description: Resource Explorer view created by this stack and used by the inventory Lambda.
+    Value: !Ref APNAttributionResourceExplorerView
+
+  ReportBucket:
+    Value: !Ref ReportBucket
+  StateMachineArn:
+    Value: !Ref StateMachine
+  InventoryLambda:
+    Value: !Ref InventoryLambda
+  ApplyTagsLambda:
+    Value: !Ref ApplyTagsLambda
+  VerifyTagsLambda:
+    Value: !Ref VerifyTagsLambda
