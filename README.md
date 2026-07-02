@@ -4,10 +4,6 @@ This repository provides a one-time CloudFormation-based helper for AWS Partners
 
 The workflow discovers taggable AWS resources using AWS Resource Explorer, applies the required attribution tag, and stores inventory, apply results, and verification evidence in S3.
 
-> This is an independent community helper. It is not an official AWS, AWS Partner Network, TD SYNNEX, SaaSify, or vendor-maintained solution.
-
----
-
 ## What this solution does
 
 The CloudFormation template deploys a Step Functions workflow with four Lambda functions:
@@ -282,7 +278,7 @@ This project contains a generic AWS automation pattern using public AWS services
 - Amazon S3
 - Resource Groups Tagging API
 
-It does not contain company-specific references, customer data, proprietary business logic, credentials, or internal documentation.
+It does not contain customer data, proprietary business logic, credentials, or internal documentation.
 
 ---
 
