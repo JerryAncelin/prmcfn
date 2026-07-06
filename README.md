@@ -1,12 +1,14 @@
 # AWS PRM / APN Attribution Tagging Framework
 
-This repository provides a one-time CloudFormation-based helper for AWS Partners who need to discover AWS resources and apply AWS Partner Revenue Measurement / APN attribution tags at scale.
+This repository provides a one-time helper for AWS Partners who need to discover AWS resources and apply AWS Partner Revenue Measurement / APN attribution tags at scale.
+
+Available as both a CloudFormation template and a Terraform module.
 
 The workflow discovers taggable AWS resources using AWS Resource Explorer, applies the required attribution tag, and stores inventory, apply results, and verification evidence in S3.
 
 ## What this solution does
 
-The CloudFormation template deploys a Step Functions workflow with four Lambda functions:
+The deployment provisions a Step Functions workflow with four Lambda functions:
 
 1. **Resolve Resource Explorer View**
    - Checks whether a Resource Explorer view already exists in the deployment Region.
@@ -35,12 +37,12 @@ The CloudFormation template deploys a Step Functions workflow with four Lambda f
 
 ## Tagging model
 
-For this implementation, the PRM attribution tag is built from two CloudFormation parameters:
+The PRM attribution tag is built from two parameters:
 
 | Parameter | Purpose |
 |---|---|
-| `PartnerCentralID` | Used as the tag key |
-| `ProductCode` | Used as the tag value |
+| `PartnerCentralID` / `partner_central_id` | Used as the tag key |
+| `ProductCode` / `product_code` | Used as the tag value |
 
 The resulting tag applied to resources is:
 
@@ -74,7 +76,7 @@ This makes the deployment more resilient in existing AWS accounts where Resource
 ## Architecture
 
 ```text
-CloudFormation Stack
+Deployment (CloudFormation or Terraform)
       |
       v
 Step Functions State Machine
@@ -104,7 +106,7 @@ Step Functions State Machine
 
 ## Deployed AWS resources
 
-The template deploys:
+Both deployment options provision the same resources:
 
 - S3 bucket for reports and evidence
 - IAM role for Lambda functions
@@ -117,26 +119,51 @@ The template deploys:
 
 ---
 
-## CloudFormation parameters
+## Repository structure
+
+```text
+.
+├── PRMCFN.yaml          # CloudFormation template
+├── terraform/
+│   ├── main.tf          # All AWS resources
+│   ├── variables.tf     # Input variables
+│   └── outputs.tf       # Stack outputs
+└── README.md
+```
+
+---
+
+## Parameters / Variables
+
+### CloudFormation parameters
 
 | Parameter | Default | Description |
 |---|---:|---|
-| `PartnerCentralID` | None | Partner Central ID used as the PRM attribution tag key. |
+| `PartnerCentralID` | `aws-apn-id` | Partner Central ID used as the PRM attribution tag key. |
 | `ProductCode` | None | Product code used as the PRM attribution tag value. |
 | `InventoryQuery` | `resourcetype.supports:tags` | Resource Explorer query used to discover resources. |
 | `ResourceExplorerViewName` | `prm-attribution-view` | Resource Explorer view name to reuse or create in the stack Region. |
+
+### Terraform variables
+
+| Variable | Default | Description |
+|---|---:|---|
+| `partner_central_id` | `aws-apn-id` | Partner Central ID used as the PRM attribution tag key. |
+| `product_code` | None | Product code used as the PRM attribution tag value. |
+| `inventory_query` | `resourcetype.supports:tags` | Resource Explorer query used to discover resources. |
+| `resource_explorer_view_name` | `prm-attribution-view` | Resource Explorer view name to reuse or create. |
 
 ---
 
 ## Deployment
 
-Deploy the CloudFormation template in the AWS account and Region where you want to run the tagging workflow.
+### CloudFormation
 
-Example using AWS CLI:
+Deploy the template in the AWS account and Region where you want to run the tagging workflow.
 
 ```bash
 aws cloudformation deploy \
-  --template-file prmcfn-with-resource-explorer-resolver.yaml \
+  --template-file PRMCFN.yaml \
   --stack-name prm-attribution-tagging \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
@@ -144,11 +171,11 @@ aws cloudformation deploy \
       ProductCode="YOUR_PRODUCT_CODE"
 ```
 
-Optional parameter override for the Resource Explorer query:
+With optional parameter overrides:
 
 ```bash
 aws cloudformation deploy \
-  --template-file prmcfn-with-resource-explorer-resolver.yaml \
+  --template-file PRMCFN.yaml \
   --stack-name prm-attribution-tagging \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
@@ -158,18 +185,50 @@ aws cloudformation deploy \
       ResourceExplorerViewName="prm-attribution-view"
 ```
 
+### Terraform
+
+Initialize and apply from the `terraform/` directory.
+
+```bash
+cd terraform
+terraform init
+terraform apply \
+  -var="product_code=YOUR_PRODUCT_CODE"
+```
+
+With all optional variables:
+
+```bash
+terraform apply \
+  -var="partner_central_id=YOUR_PARTNER_CENTRAL_ID" \
+  -var="product_code=YOUR_PRODUCT_CODE" \
+  -var="inventory_query=resourcetype.supports:tags" \
+  -var="resource_explorer_view_name=prm-attribution-view"
+```
+
+Or using a `terraform.tfvars` file:
+
+```hcl
+partner_central_id          = "YOUR_PARTNER_CENTRAL_ID"
+product_code                = "YOUR_PRODUCT_CODE"
+inventory_query             = "resourcetype.supports:tags"
+resource_explorer_view_name = "prm-attribution-view"
+```
+
 ---
 
 ## Running the workflow
 
 After deployment, start the Step Functions state machine from the AWS Console or CLI.
 
-CLI example:
-
 ```bash
 aws stepfunctions start-execution \
-  --state-machine-arn "STATE_MACHINE_ARN_FROM_CLOUDFORMATION_OUTPUT"
+  --state-machine-arn "STATE_MACHINE_ARN"
 ```
+
+The state machine ARN is available in:
+- CloudFormation: the `StateMachineArn` stack output
+- Terraform: the `state_machine_arn` output (`terraform output state_machine_arn`)
 
 The state machine input can be empty. The workflow resolves the Resource Explorer view and passes the view ARN internally between states.
 
@@ -189,8 +248,6 @@ verification/
 
 Contains discovered resources and the tag expected to be applied.
 
-Example path:
-
 ```text
 inventory/apn-inventory-YYYYMMDDTHHMMSSZ.json
 ```
@@ -199,8 +256,6 @@ inventory/apn-inventory-YYYYMMDDTHHMMSSZ.json
 
 Contains tagging results and failed resources returned by the Resource Groups Tagging API.
 
-Example path:
-
 ```text
 apply-results/apn-apply-YYYYMMDDTHHMMSSZ.json
 ```
@@ -208,8 +263,6 @@ apply-results/apn-apply-YYYYMMDDTHHMMSSZ.json
 ### Verification output
 
 Contains the final observed tags and whether the expected tag value was found.
-
-Example path:
 
 ```text
 verification/apn-verification-YYYYMMDDTHHMMSSZ.json
@@ -253,16 +306,22 @@ These exclusions are implemented to avoid applying tags to resources that are AW
 - Some AWS resources discovered by Resource Explorer may not support tagging through the generic Resource Groups Tagging API.
 - Some resources may require service-specific tagging APIs.
 - Some AWS-managed resources may be discoverable but should not be tagged directly.
-- Stack deletion does not remove tags that were already applied to resources.
+- Destroying the deployment does not remove tags that were already applied to resources.
 - The Resource Explorer resolver intentionally avoids changing the account/Region default Resource Explorer view association.
 
 ---
 
 ## Cleanup behavior
 
-Deleting the CloudFormation stack removes the deployed automation resources such as Lambdas, IAM roles, Step Functions state machine, and the report bucket according to CloudFormation behavior.
+### CloudFormation
 
-Tags already applied to AWS resources are not removed by deleting this stack.
+Deleting the stack removes the deployed automation resources (Lambdas, IAM roles, Step Functions state machine, and the report bucket).
+
+### Terraform
+
+Running `terraform destroy` removes all resources provisioned by the module.
+
+Tags already applied to AWS resources are not removed by either cleanup method.
 
 ---
 
@@ -270,7 +329,7 @@ Tags already applied to AWS resources are not removed by deleting this stack.
 
 This project contains a generic AWS automation pattern using public AWS services:
 
-- AWS CloudFormation
+- AWS CloudFormation / Terraform (hashicorp/aws provider)
 - AWS Resource Explorer
 - AWS Lambda
 - AWS Step Functions
