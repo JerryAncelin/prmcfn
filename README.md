@@ -41,7 +41,7 @@ The PRM attribution tag is built from two parameters:
 
 | Parameter | Purpose |
 |---|---|
-| `PartnerCentralID` / `partner_central_id` | Used as the tag key |
+| `PartnerCentralID` / `partner_central_id` | Used as the tag key — must be set to `aws-apn-id` |
 | `ProductCode` / `product_code` | Used as the tag value |
 
 The resulting tag applied to resources is:
@@ -53,7 +53,7 @@ The resulting tag applied to resources is:
 Example:
 
 ```text
-1234567 = my-product-code
+aws-apn-id = my-product-code
 ```
 
 ---
@@ -139,7 +139,7 @@ Both deployment options provision the same resources:
 
 | Parameter | Default | Description |
 |---|---:|---|
-| `PartnerCentralID` | `aws-apn-id` | Partner Central ID used as the PRM attribution tag key. |
+| `PartnerCentralID` | `aws-apn-id` | Partner Central ID used as the PRM attribution tag key. Must be `aws-apn-id`. |
 | `ProductCode` | None | Product code used as the PRM attribution tag value. |
 | `InventoryQuery` | `resourcetype.supports:tags` | Resource Explorer query used to discover resources. |
 | `ResourceExplorerViewName` | `prm-attribution-view` | Resource Explorer view name to reuse or create in the stack Region. |
@@ -148,7 +148,7 @@ Both deployment options provision the same resources:
 
 | Variable | Default | Description |
 |---|---:|---|
-| `partner_central_id` | `aws-apn-id` | Partner Central ID used as the PRM attribution tag key. |
+| `partner_central_id` | `aws-apn-id` | Partner Central ID used as the PRM attribution tag key. Must be `aws-apn-id`. |
 | `product_code` | None | Product code used as the PRM attribution tag value. |
 | `inventory_query` | `resourcetype.supports:tags` | Resource Explorer query used to discover resources. |
 | `resource_explorer_view_name` | `prm-attribution-view` | Resource Explorer view name to reuse or create. |
