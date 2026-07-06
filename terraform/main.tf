@@ -7,6 +7,11 @@ terraform {
   }
 }
 
+provider "aws" {
+  region  = var.aws_region
+  profile = var.aws_profile # optional: remove if using environment variables or IAM role
+}
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
