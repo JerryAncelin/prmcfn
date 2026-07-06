@@ -8,8 +8,19 @@ terraform {
 }
 
 provider "aws" {
-  region  = var.aws_region
-  profile = var.aws_profile # optional: remove if using environment variables or IAM role
+  region = var.aws_region
+
+  # Option 1 – Named AWS CLI profile (uncomment var.aws_profile in variables.tf)
+  # profile = var.aws_profile
+
+  # Option 2 – IAM role assumption (uncomment var.assume_role_arn in variables.tf)
+  # dynamic "assume_role" {
+  #   for_each = var.assume_role_arn != null ? [1] : []
+  #   content {
+  #     role_arn    = var.assume_role_arn
+  #     external_id = var.assume_role_external_id # remove if not required
+  #   }
+  # }
 }
 
 data "aws_region" "current" {}
